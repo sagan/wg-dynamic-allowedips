@@ -28,6 +28,8 @@ Where:
   no effect to WireGuard, this program uses it to associate the subnet with the peer.
   The routing table records are expected to be added by Bird using BGP / OSPF.
 
+It does a full routing scan & update when starting up, and when receiving SIGHUP signal.
+
 ## Usage
 
 Just run `wg-dynamic-allowedips` to start the daemon. No flag is mandatory.

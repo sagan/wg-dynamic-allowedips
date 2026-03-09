@@ -1,4 +1,6 @@
 use clap::Parser;
+use signal_hook::consts::signal::SIGHUP;
+use signal_hook::iterator::Signals;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -8,7 +10,10 @@ use std::thread;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, about = r#"
+#[command(
+    author,
+    version,
+    about = r#"
 Daemon to watch Linux kernel routes and dynamically update WireGuard peer's `allowed-ips`.
 It's intended to be used to help run BGP / OSPF over WireGuard mesh network.
 
@@ -26,16 +31,23 @@ Where:
   the `192.168.1.0/24` subnet through `192.168.100.10` peer. While the `via <peer_ip>` directive itself has
   no effect to wireguard, this program uses it to associate the subnet with the peer.
   The routing table records are expected to be added by Bird using BGP / OSPF.
-"#)]
+
+It does a full routing scan & update when starting up, and when receiving SIGHUP signal.
+"#
+)]
 struct Args {
     /// Specific WireGuard interface to watch (e.g., wg0). Watches all wg* interfaces if omitted.
     #[arg(short, long)]
     interface: Option<String>,
 
     /// Directory containing WireGuard .conf files for static routing base.
-    /// Set to "none" to disable parsing and only use the /32 anchor IP.
+    /// Set to "none" to disable parsing.
     #[arg(short, long, default_value = "/etc/wireguard")]
     config_dir: String,
+
+    /// Path to write the daemon's PID file. Set to "none" to disable.
+    #[arg(short, long, default_value = "/var/run/wg-dynamic-allowedips.pid")]
+    pidfile: String,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +69,17 @@ fn main() {
     let args = Args::parse();
 
     println!("Starting wg-dynamic-allowedips...");
+
+    // 1. Write PID file
+    if args.pidfile.to_lowercase() != "none" {
+        let pid = std::process::id();
+        if let Err(e) = std::fs::write(&args.pidfile, pid.to_string()) {
+            eprintln!("Warning: Failed to write PID file {}: {}", args.pidfile, e);
+        } else {
+            println!("PID {} written to {}", pid, args.pidfile);
+        }
+    }
+
     if let Some(ref iface) = args.interface {
         println!("Watching specific interface: {}", iface);
     } else {
@@ -69,14 +92,24 @@ fn main() {
         println!("Reading static config base from: {}", args.config_dir);
     }
 
-    // 1. Run a full scan and update on program start
+    // 2. Run a full scan and update on program start
     sync_state(&args.interface, &args.config_dir);
 
-    // 2. Setup channel for triggers
+    // 3. Setup channel for triggers
     let (tx, rx) = mpsc::channel();
     let target_iface_clone = args.interface.clone();
+    let tx_sighup = tx.clone();
 
-    // 3. Spawn a thread to monitor 'ip monitor route'
+    // 4. Spawn a thread to listen for SIGHUP
+    thread::spawn(move || {
+        let mut signals = Signals::new(&[SIGHUP]).expect("Failed to create signal listener");
+        for _sig in signals.forever() {
+            println!("\nReceived SIGHUP, scheduling full scan...");
+            let _ = tx_sighup.send(());
+        }
+    });
+
+    // 5. Spawn a thread to monitor 'ip monitor route'
     thread::spawn(move || {
         let mut child = Command::new("ip")
             .args(["monitor", "route"])
@@ -101,7 +134,7 @@ fn main() {
         }
     });
 
-    // 4. Main loop with debounce logic
+    // 6. Main loop with debounce logic
     loop {
         if rx.recv().is_ok() {
             loop {
@@ -112,7 +145,7 @@ fn main() {
                 }
             }
 
-            println!("\nRouting change detected and debounced. Synchronizing...");
+            println!("\nTrigger detected and debounced. Synchronizing...");
             sync_state(&args.interface, &args.config_dir);
         }
     }
@@ -132,7 +165,6 @@ fn sync_state(target_interface: &Option<String>, config_dir: &str) {
         }
     }
 
-    // If an interface was explicitly passed, ensure we check it even if no dynamic routes exist yet
     if let Some(iface) = target_interface {
         ifaces_to_update.insert(iface.clone());
     }
@@ -175,7 +207,6 @@ fn get_bird_routes() -> Vec<Route> {
     routes
 }
 
-/// Parses the wg.conf file to extract static AllowedIPs for each public key
 fn parse_wg_conf(path: &str) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     let file = match File::open(path) {
@@ -198,13 +229,11 @@ fn parse_wg_conf(path: &str) -> HashMap<String, Vec<String>> {
         if line.starts_with("[Peer]") {
             current_pubkey = None;
         } else if line.to_lowercase().starts_with("publickey") {
-            // FIXED: Use split_once to avoid stripping Base64 '=' padding
             if let Some((_, key)) = line.split_once('=') {
                 current_pubkey = Some(key.trim().to_string());
             }
         } else if line.to_lowercase().starts_with("allowedips") {
             if let Some(pubkey) = &current_pubkey {
-                // FIXED: Use split_once here as well for safety
                 if let Some((_, ips_str)) = line.split_once('=') {
                     let ips: Vec<String> = ips_str
                         .split(',')
@@ -237,7 +266,6 @@ fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &st
 
     let mut active_peers: Vec<PeerState> = Vec::new();
 
-    // 1. Get current state from wg show
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 2 {
@@ -261,7 +289,6 @@ fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &st
         });
     }
 
-    // 2. Load Static Base State
     let static_config = if config_dir.to_lowercase() != "none" {
         let conf_path = format!("{}/{}.conf", config_dir, iface);
         parse_wg_conf(&conf_path)
@@ -269,42 +296,36 @@ fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &st
         HashMap::new()
     };
 
-    // 3. Calculate Desired State and Apply
     for peer in active_peers {
         let mut target_ips_set: HashSet<String> = HashSet::new();
 
-        // A. Add Static IPs from config
         if let Some(static_ips) = static_config.get(&peer.pubkey) {
             for ip in static_ips {
-                target_ips_set.insert(ip.clone());
+                // Apply normalization here
+                target_ips_set.insert(normalize_ip(ip));
             }
         }
 
-        // B. ALWAYS ensure the anchor IP is in the target list
         target_ips_set.insert(peer.anchor_with_mask.clone());
 
-        // C. Add Active Dynamic Routes
         for route in all_routes {
             if route.dev == iface && route.via_ip == peer.anchor_ip_stripped {
-                target_ips_set.insert(route.prefix.clone());
+                // Apply normalization here
+                target_ips_set.insert(normalize_ip(&route.prefix));
             }
         }
 
-        // 4. Compare using HashSets to ignore ordering differences from 'wg show'
         let current_ips_set: HashSet<String> = peer.current_ips.iter().cloned().collect();
 
         if target_ips_set != current_ips_set {
-            // Filter out the anchor IP from the rest of the list so we can sort them
             let mut remaining_ips: Vec<String> = target_ips_set
                 .iter()
                 .filter(|ip| **ip != peer.anchor_with_mask)
                 .cloned()
                 .collect();
 
-            // Sort the dynamic/static routes alphabetically for clean output
             remaining_ips.sort();
 
-            // Reconstruct the final list: Anchor IP ALWAYS goes first
             let mut final_ips_vec = vec![peer.anchor_with_mask.clone()];
             final_ips_vec.extend(remaining_ips);
 
@@ -329,5 +350,17 @@ fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &st
                 eprintln!("Failed to update WireGuard peer {}: {}", peer.pubkey, e);
             }
         }
+    }
+}
+
+/// Normalizes an IP string to include a CIDR mask.
+/// IPv4 defaults to /32, IPv6 defaults to /128.
+fn normalize_ip(ip: &str) -> String {
+    if ip.contains('/') {
+        ip.to_string()
+    } else if ip.contains(':') {
+        format!("{}/128", ip)
+    } else {
+        format!("{}/32", ip)
     }
 }
